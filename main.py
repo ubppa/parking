@@ -381,6 +381,39 @@ def apply_vehicle_settings_from_ui():
         mode_text = current_mode.get() if current_mode is not None else "none"
         status_label.config(text=f"Mode: {mode_text} | 動作 {len(MOVEMENTS_LIST)}件 (車両設定更新)")
 
+
+def append_status_message(message: str) -> None:
+    if not message:
+        return
+
+    def _append():
+        if progress_log is None or not progress_log.winfo_exists():
+            return
+        progress_log.configure(state="normal")
+        progress_log.insert(tk.END, f"{datetime.now():%H:%M:%S} {message}\n")
+        progress_log.see(tk.END)
+        progress_log.configure(state="disabled")
+
+    if root is not None:
+        root.after(0, _append)
+    else:
+        _append()
+
+
+def update_progress(value: Optional[float] = None, message: Optional[str] = None) -> None:
+    def _update():
+        if run_popup is None or not run_popup.winfo_exists():
+            return
+        if value is not None and progress_var is not None:
+            progress_var.set(max(0.0, min(100.0, value)))
+        if message is not None and progress_message_var is not None:
+            progress_message_var.set(message)
+
+    if root is not None:
+        root.after(0, _update)
+    else:
+        _update()
+
 # --- UI グローバル参照 (initialize_ui 内で設定) ---
 root = None
 canvas = None
@@ -417,6 +450,10 @@ forward_steps_var = None
 backward_steps_var = None
 min_turn_radius_var = None
 config_path_var = None
+progress_var = None
+progress_message_var = None
+progress_bar = None
+progress_log = None
 
 # ======================================================
 # 衝突判定のためのポリゴン交差判定（SATを用いる）
@@ -601,6 +638,8 @@ def run_genetic_algorithm(
     movements=None,
     enable_parallel=True,
     log_dir=LOG_DIR,
+    status_callback=None,
+    progress_callback=None,
 ):
     movements = movements or MOVEMENTS_LIST
     movement_count = len(movements)
@@ -643,6 +682,10 @@ def run_genetic_algorithm(
         max_workers = min(os.cpu_count() or 2, POPULATION_SIZE)
         executor = ProcessPoolExecutor(max_workers=max_workers)
 
+    if status_callback:
+        status_callback("GA探索を開始しました。")
+    if progress_callback:
+        progress_callback(0.0)
     try:
         for generation in range(GENERATIONS):
             fitness_scores, eval_details = evaluate_population(
@@ -653,6 +696,8 @@ def run_genetic_algorithm(
                 movements=movements,
                 executor=executor,
             )
+            if progress_callback:
+                progress_callback(100.0 * (generation + 1) / max(1, GENERATIONS))
             gen_best_index = min(range(len(fitness_scores)), key=lambda i: fitness_scores[i])
             gen_best_fitness = fitness_scores[gen_best_index]
 
@@ -660,17 +705,23 @@ def run_genetic_algorithm(
                 best_fitness = gen_best_fitness
                 best_genome = population[gen_best_index][:]
                 stagnation = 0
+                if status_callback:
+                    status_callback(f"世代 {generation}: 新しい最良個体 (フィットネス {best_fitness:.2f})")
             else:
                 stagnation += 1
 
             if best_fitness < 10:
                 print(f"Early stopping at generation {generation} with fitness {best_fitness:.2f}")
+                if status_callback:
+                    status_callback("目標精度に到達したため早期終了しました。")
                 break
 
             if stagnation and stagnation % 50 == 0:
                 mutation_rate = min(mutation_rate * 1.2, 0.6)
                 addition_rate = min(addition_rate + 0.05, 0.8)
                 deletion_rate = min(deletion_rate + 0.03, 0.7)
+                if status_callback:
+                    status_callback(f"停滞検出: 操作率を調整します (mutation={mutation_rate:.2f})")
             elif stagnation == 0:
                 mutation_rate = max(mutation_rate * 0.9, 0.01)
                 addition_rate = max(addition_rate * 0.95, 0.05)
@@ -693,16 +744,17 @@ def run_genetic_algorithm(
                 new_population.append(offspring)
             population = new_population
 
+            mean_fitness = float(np.mean(fitness_scores)) if fitness_scores else float("inf")
+            collision_rate = (
+                sum(1 for d in eval_details if d["collision"]) / len(eval_details)
+                if eval_details else 0.0
+            )
+            avg_distance = (
+                float(np.mean([d["total_distance"] for d in eval_details]))
+                if eval_details else 0.0
+            )
+
             if log_writer:
-                mean_fitness = float(np.mean(fitness_scores)) if fitness_scores else float("inf")
-                collision_rate = (
-                    sum(1 for d in eval_details if d["collision"]) / len(eval_details)
-                    if eval_details else 0.0
-                )
-                avg_distance = (
-                    float(np.mean([d["total_distance"] for d in eval_details]))
-                    if eval_details else 0.0
-                )
                 diversity = len({tuple(genome) for genome in population}) / len(population)
                 log_writer.writerow([
                     generation,
@@ -720,6 +772,8 @@ def run_genetic_algorithm(
 
             if generation % 100 == 0:
                 print(f"Generation {generation}: Best Fitness = {best_fitness:.2f}")
+                if status_callback:
+                    status_callback(f"世代 {generation}: 最良 {best_fitness:.2f} / 平均 {mean_fitness:.2f}")
     finally:
         if executor:
             executor.shutdown()
@@ -728,6 +782,8 @@ def run_genetic_algorithm(
 
     end_time = time.time()
     print(f"Genetic algorithm completed in {end_time - start_time:.2f} seconds.")
+    if status_callback:
+        status_callback(f"GA完了 (所要時間 {end_time - start_time:.1f} 秒)")
     return best_genome, best_fitness, log_path
 
 def compute_trajectory(genome, START_STATE, movements=None):
@@ -1019,20 +1075,23 @@ def clear_obstacles():
 # --- シミュレーション実行部 ---
 def simulation_thread():
     global start_pos, goal_pos, obstacles
+    append_status_message("シミュレーション初期化を開始しました。")
+    update_progress(0.0, "初期設定を確認しています...")
+
     # --- ここから自動初期値セット ---
     if start_pos is None:
-        # デフォルト値 (画面左上)
         start_pos = (100, 100, 0, "forward")
         root.after(0, update_start_polygon)
+        append_status_message("スタート位置をデフォルト値に設定しました。")
     if goal_pos is None:
-        # デフォルト値 (画面右下)
         goal_pos = (700, 500, 0, "forward")
         root.after(0, update_goal_polygon)
+        append_status_message("ゴール位置をデフォルト値に設定しました。")
     if not obstacles:
-        # デフォルト障害物（中央に1つ）
         obstacles.append((300, 200, 500, 400))
         oid = canvas.create_rectangle(300, 200, 500, 400, outline="purple", dash=(2,2))
         obstacle_ids.append(oid)
+        append_status_message("デフォルト障害物を追加しました。")
     # --- ここまで自動初期値セット ---
 
     try:
@@ -1046,6 +1105,7 @@ def simulation_thread():
         MAX_GENES = int(max_gene_var.get())
         ELITE_COUNT = int(elite_var.get())
     except Exception as e:
+        append_status_message("GAパラメータの読み込みに失敗しました。")
         if root is not None:
             root.after(0, lambda: messagebox.showerror("エラー", f"GAパラメータの入力値に誤りがあります。\n{e}"))
         if run_popup is not None and run_popup.winfo_exists():
@@ -1054,6 +1114,8 @@ def simulation_thread():
             else:
                 run_popup.destroy()
         return
+
+    append_status_message("GAパラメータを適用しました。探索を準備しています。")
 
     effective_start = effective_state(start_pos)
     effective_goal = effective_state(goal_pos)
@@ -1066,18 +1128,35 @@ def simulation_thread():
     ]
     sim_obstacles = obstacles.copy()
     sim_obstacles.extend(boundaries)
-    
+
+    update_progress(0.0, "GA探索を開始しています...")
+    last_progress = {"value": 0.0}
+
+    def progress_callback(percent: float):
+        delta = percent - last_progress["value"]
+        last_progress["value"] = percent
+        message = None
+        if delta >= 5.0 or percent >= 100.0 or percent <= 0.1:
+            message = f"GA探索進行中... {percent:.1f}%"
+        update_progress(percent, message)
+
     best_genome, best_fitness, log_path = run_genetic_algorithm(
         sim_obstacles,
         effective_start,
         effective_goal,
         movements=MOVEMENTS_LIST,
         enable_parallel=True,
+        status_callback=append_status_message,
+        progress_callback=progress_callback,
     )
+    append_status_message(f"GA探索が完了しました (最良フィットネス {best_fitness:.2f})")
+    update_progress(100.0, "シミュレーション結果を描画しています...")
     print("Best Fitness:", best_fitness)
     if log_path:
+        append_status_message(f"世代別ログを {log_path} に保存しました。")
         print(f"世代別ログを {log_path} に保存しました。")
     if not best_genome:
+        append_status_message("経路が見つかりませんでした。パラメータを再調整してください。")
         if root is not None:
             root.after(0, lambda: messagebox.showwarning("結果なし", "有効な経路が見つかりませんでした。パラメータを調整してください。"))
         if run_popup is not None and run_popup.winfo_exists():
@@ -1091,14 +1170,25 @@ def simulation_thread():
     root.after(0, lambda: run_popup.destroy() if run_popup is not None and run_popup.winfo_exists() else None)
 
 def start_simulation_thread():
-    global run_popup
+    global run_popup, progress_var, progress_message_var, progress_bar, progress_log
     if root is None:
+        return
+    if run_popup is not None and run_popup.winfo_exists():
+        append_status_message("別のシミュレーションが進行中です。完了をお待ちください。")
         return
     run_popup = tk.Toplevel(root)
     run_popup.title("実行中")
-    ttk.Label(run_popup, text="シミュレーション実行中...").pack(padx=20, pady=20)
-    run_popup.geometry("200x100")
+    run_popup.geometry("340x220")
+    ttk.Label(run_popup, text="シミュレーション実行中...").pack(padx=12, pady=(12, 6), anchor="w")
+    progress_message_var = tk.StringVar(value="初期化中...")
+    ttk.Label(run_popup, textvariable=progress_message_var, wraplength=300, justify="left").pack(fill=tk.X, padx=12)
+    progress_var = tk.DoubleVar(value=0.0)
+    progress_bar = ttk.Progressbar(run_popup, mode="determinate", maximum=100, variable=progress_var)
+    progress_bar.pack(fill=tk.X, padx=12, pady=6)
+    progress_log = tk.Text(run_popup, height=6, width=40, state="disabled", wrap="word")
+    progress_log.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
     t = threading.Thread(target=simulation_thread)
+    t.daemon = True
     t.start()
 
 def show_animation(trajectory, moves, best_fitness, sim_obstacles):
